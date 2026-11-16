@@ -1,0 +1,13 @@
+{
+  "name": "pinsnip",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Menu bar screenshot and pinning tool for macOS",
+  "scripts": {
+    "build": "bash scripts/make-app.sh",
+    "dmg": "bash scripts/make-dmg.sh",
+    "launch": "bash scripts/run.sh",
+    "open": "open dist/PinSnip.app",
+    "clean": "rm -rf .build dist"
+  }
+}

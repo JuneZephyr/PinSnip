@@ -1,0 +1,9 @@
+# Build output
+.build/
+dist/
+release/
+*.dmg
+
+# macOS
+.DS_Store
+._*
