@@ -67,6 +67,123 @@ enum AnnotationMark {
         }
     }
 
+    var bounds: NSRect {
+        switch self {
+        case .shape(_, let rect, _), .text(let rect, _, _, _, _), .mosaic(let rect, _, _):
+            return rect.standardized
+        case .line(let from, let to, _), .arrow(let from, let to, _):
+            return NSRect(
+                x: min(from.x, to.x),
+                y: min(from.y, to.y),
+                width: max(1, abs(to.x - from.x)),
+                height: max(1, abs(to.y - from.y))
+            )
+        case .pen(let points, _), .mosaicBrush(let points, _, _):
+            guard let first = points.first else { return .zero }
+            return points.reduce(NSRect(origin: first, size: .zero)) { rect, point in
+                rect.union(NSRect(origin: point, size: .zero))
+            }
+        }
+    }
+
+    /// Boxes, lines, arrows and text can be grabbed after they are drawn.
+    func hit(_ point: NSPoint) -> Bool {
+        switch self {
+        case .shape(let kind, let rect, let style):
+            if kind == .line {
+                return segmentDistance(rectLine(rect), point) <= max(8, style.width + 4)
+            }
+            return shapeContains(rect.standardized, point, tolerance: max(8, style.width + 4), filled: style.filled)
+        case .line(let from, let to, let style):
+            return segmentDistance((from, to), point) <= max(8, style.width + 4)
+        case .arrow(let from, let to, let style):
+            return segmentDistance((from, to), point) <= max(10, style.width + 6)
+        case .pen(let points, let style):
+            let reach = max(8, style.width + 4)
+            guard points.count >= 2 else {
+                return points.first.map { hypot($0.x - point.x, $0.y - point.y) <= reach } ?? false
+            }
+            for index in 1..<points.count where segmentDistance((points[index - 1], points[index]), point) <= reach {
+                return true
+            }
+            return false
+        case .text(let rect, _, _, _, _):
+            return rect.insetBy(dx: -6, dy: -4).contains(point)
+        default:
+            return false
+        }
+    }
+
+    func translated(dx: CGFloat, dy: CGFloat) -> AnnotationMark {
+        switch self {
+        case .shape(let kind, let rect, let style):
+            return .shape(kind, rect.offsetBy(dx: dx, dy: dy), style)
+        case .line(let from, let to, let style):
+            return .line(shift(from, dx, dy), shift(to, dx, dy), style)
+        case .arrow(let from, let to, let style):
+            return .arrow(shift(from, dx, dy), shift(to, dx, dy), style)
+        case .pen(let points, let style):
+            return .pen(points.map { shift($0, dx, dy) }, style)
+        case .text(let rect, let string, let size, let color, let background):
+            return .text(rect.offsetBy(dx: dx, dy: dy), string, size, color, background)
+        case .mosaic(let rect, let pixel, let blur):
+            return .mosaic(rect.offsetBy(dx: dx, dy: dy), pixel, blur)
+        case .mosaicBrush(let points, let pixel, let blur):
+            return .mosaicBrush(points.map { shift($0, dx, dy) }, pixel, blur)
+        }
+    }
+
+    func applying(_ style: AnnotateStyle) -> AnnotationMark {
+        let stroke = style.stroke
+        switch self {
+        case .shape(let kind, let rect, _):
+            return .shape(kind, rect, stroke)
+        case .line(let from, let to, _):
+            return .line(from, to, stroke)
+        case .arrow(let from, let to, _):
+            return .arrow(from, to, stroke)
+        case .pen(let points, _):
+            return .pen(points, stroke)
+        case .text(let rect, let string, let size, _, _):
+            var next = rect
+            if abs(style.textSize - size) > 0.5 {
+                next.size.height = max(next.height, style.textSize * 1.35)
+            }
+            return .text(next, string, style.textSize, style.color, style.textBackground)
+        default:
+            return self
+        }
+    }
+
+    private func shapeContains(_ rect: NSRect, _ point: NSPoint, tolerance: CGFloat, filled: Bool) -> Bool {
+        let outer = rect.insetBy(dx: -tolerance, dy: -tolerance)
+        guard outer.contains(point) else { return false }
+        if filled { return true }
+        let inner = rect.insetBy(dx: tolerance, dy: tolerance)
+        if inner.width < 4 || inner.height < 4 { return true }
+        return !inner.contains(point)
+    }
+
+    private func rectLine(_ rect: NSRect) -> (NSPoint, NSPoint) {
+        let rect = rect.standardized
+        return (NSPoint(x: rect.minX, y: rect.minY), NSPoint(x: rect.maxX, y: rect.maxY))
+    }
+
+    private func segmentDistance(_ segment: (NSPoint, NSPoint), _ point: NSPoint) -> CGFloat {
+        let from = segment.0
+        let to = segment.1
+        let dx = to.x - from.x
+        let dy = to.y - from.y
+        let length = dx * dx + dy * dy
+        if length < 1 { return hypot(point.x - from.x, point.y - from.y) }
+        let t = min(1, max(0, ((point.x - from.x) * dx + (point.y - from.y) * dy) / length))
+        return hypot(point.x - (from.x + t * dx), point.y - (from.y + t * dy))
+    }
+
+    private func shift(_ point: NSPoint, _ dx: CGFloat, _ dy: CGFloat) -> NSPoint {
+        NSPoint(x: point.x + dx, y: point.y + dy)
+    }
+
     func draw(pixels: PixelBuffer?) {
         switch self {
         case .shape(let kind, let rect, let style):

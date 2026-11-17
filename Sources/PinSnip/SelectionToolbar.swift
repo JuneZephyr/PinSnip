@@ -15,6 +15,7 @@ final class SelectionToolbar: NSPanel {
     var onCopy: (() -> Void)?
     var onPin: (() -> Void)?
     var onSave: (() -> Void)?
+    var onUndo: (() -> Void)?
     var onCancel: (() -> Void)?
     var onLong: (() -> Void)?
     var onTool: ((AnnotateTool) -> Void)?
@@ -31,6 +32,8 @@ final class SelectionToolbar: NSPanel {
     private var manualRadio: RadioControl?
     private var autoButton: PillButton?
     private var toolButtons: [AnnotateTool: IconButton] = [:]
+    private var undoButton: IconButton?
+    private var undoEnabled = false
 
     init() {
         super.init(
@@ -54,7 +57,7 @@ final class SelectionToolbar: NSPanel {
         showTools()
     }
 
-    /// Icon row: 形状 箭头 画笔 文本 马赛克 钉在桌面 长截图 保存 取消 完成.
+    /// Icon row: 形状 箭头 画笔 文本 马赛克 钉在桌面 长截图 保存 撤销 取消 完成.
     func showTools() {
         chrome.subviews.forEach { $0.removeFromSuperview() }
         verticalRadio = nil
@@ -62,6 +65,7 @@ final class SelectionToolbar: NSPanel {
         manualRadio = nil
         autoButton = nil
         toolButtons = [:]
+        undoButton = nil
 
         let height: CGFloat = 52
         chrome.cornerRadius = height / 2
@@ -76,6 +80,7 @@ final class SelectionToolbar: NSPanel {
             (nil, .symbol("pin"), Palette.label, "钉在桌面", { [weak self] in self?.onPin?() }),
             (nil, .symbol("scissors"), Palette.label, "长截图", { [weak self] in self?.onLong?() }),
             (nil, .symbol("square.and.arrow.down"), Palette.label, "保存", { [weak self] in self?.onSave?() }),
+            (nil, .symbol("arrow.uturn.backward"), Palette.label, "撤销 (⌘Z)", { [weak self] in self?.onUndo?() }),
             (nil, .symbol("xmark"), Palette.red, "取消", { [weak self] in self?.onCancel?() }),
             (nil, .symbol("checkmark"), Palette.green, "完成", { [weak self] in self?.onCopy?() })
         ]
@@ -93,6 +98,10 @@ final class SelectionToolbar: NSPanel {
             button.onClick = icon.4
             if let tool = icon.0 {
                 toolButtons[tool] = button
+            }
+            if icon.3.hasPrefix("撤销") {
+                button.isEnabled = undoEnabled
+                undoButton = button
             }
             let width = button.fittingWidth
             button.frame = NSRect(x: x, y: (height - 36) / 2, width: width, height: 36)
@@ -184,6 +193,11 @@ final class SelectionToolbar: NSPanel {
         chrome.frame = NSRect(origin: .zero, size: size)
         chrome.needsDisplay = true
         setContentSize(size)
+    }
+
+    func setUndoEnabled(_ enabled: Bool) {
+        undoEnabled = enabled
+        undoButton?.isEnabled = enabled
     }
 
     func setActiveTool(_ tool: AnnotateTool?) {
@@ -402,6 +416,9 @@ final class IconButton: NSView {
     var isOn = false {
         didSet { needsDisplay = true }
     }
+    var isEnabled = true {
+        didSet { alphaValue = isEnabled ? 1 : 0.35 }
+    }
 
     private let mark: IconMark
     private let tint: NSColor
@@ -500,13 +517,13 @@ final class IconButton: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
+        guard isEnabled else { return }
         alphaValue = 0.55
     }
 
     override func mouseUp(with event: NSEvent) {
-        alphaValue = 1
-        if bounds.contains(convert(event.locationInWindow, from: nil)) {
-            onClick?()
-        }
+        alphaValue = isEnabled ? 1 : 0.35
+        guard isEnabled, bounds.contains(convert(event.locationInWindow, from: nil)) else { return }
+        onClick?()
     }
 }

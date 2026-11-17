@@ -68,6 +68,8 @@ final class OverlayView: NSView {
     var annotationMarks: [AnnotationMark] = []
     var annotationDraft: AnnotationMark?
     var annotationPixels: PixelBuffer?
+    var annotationSelection: NSRect = .zero
+    var hasAnnotationSelection = false
 
     private let handleSize: CGFloat = 7
 
@@ -97,6 +99,12 @@ final class OverlayView: NSView {
                 mark.draw(pixels: annotationPixels)
             }
             annotationDraft?.draw(pixels: annotationPixels)
+            if hasAnnotationSelection, !annotationSelection.isEmpty {
+                let outline = NSBezierPath(roundedRect: annotationSelection, xRadius: 3, yRadius: 3)
+                NSColor.systemBlue.setStroke()
+                outline.lineWidth = 1.5
+                outline.stroke()
+            }
             NSGraphicsContext.current?.restoreGraphicsState()
         }
 

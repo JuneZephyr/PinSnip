@@ -43,6 +43,7 @@ final class SelectionController: NSObject {
         case moving
         case resizing(ResizeEdges)
         case drawing
+        case movingMark
     }
 
     /// Edges of the selection in CoreGraphics space, where y grows downward.
@@ -62,6 +63,15 @@ final class SelectionController: NSObject {
     private var options: ToolOptionsBar?
     private let annotateStyle = AnnotateStyle()
     private var activeTool: AnnotateTool?
+    private var selectedMark: Int?
+    private var markDragOrigin: AnnotationMark?
+    private var markDragAnchor = NSPoint.zero
+    private var markDragMoved = false
+    private var markHistory: [MarkHistory] = []
+    private var moveHistory: MarkHistory?
+    private var textHistory: MarkHistory?
+    private var styleHistory: MarkHistory?
+    private var styleGesture = false
     private var marks: [AnnotationMark] = []
     private var draft: AnnotationMark?
     private var pixels: PixelBuffer?
@@ -190,18 +200,20 @@ final class SelectionController: NSObject {
 
     // MARK: - Keyboard
 
-    func handleKeyDown(_ event: NSEvent) {
+    @discardableResult
+    func handleKeyDown(_ event: NSEvent) -> Bool {
         let keyCode = event.keyCode
         let command = event.modifierFlags.contains(.command)
 
         // While a text annotation is being typed the field owns the keyboard:
         // Return and Escape finish the text, and a letter like L must never
-        // start the long capture behind the user's back.
+        // start the long capture behind the user's back. ⌘Z stays with the field.
         if textField != nil {
             if keyCode == 36 || keyCode == 76 || keyCode == 53 {
                 commitText()
+                return true
             }
-            return
+            return false
         }
 
         if keyCode == 53 { // escape
@@ -210,28 +222,35 @@ final class SelectionController: NSObject {
             } else {
                 cancel()
             }
-            return
+            return true
         }
 
         if keyCode == 36 || keyCode == 76 { // return / keypad enter
             confirm()
-            return
+            return true
+        }
+
+        if command && keyCode == 6 && state == .selected
+            && event.modifierFlags.intersection([.shift, .option, .control]).isEmpty {
+            undoAnnotation()
+            return true
         }
 
         if !command && keyCode == 37 && state == .selected {
             enterLongMode()
-            return
+            return true
         }
 
-        guard state == .selected || state == .result || state == .capturingLong else { return }
+        guard state == .selected || state == .result || state == .capturingLong else { return false }
         if command && keyCode == 17 { // ⌘T
             pinCurrent()
-            return
+            return true
         }
         if command && keyCode == 1 { // ⌘S
             saveCurrent()
-            return
+            return true
         }
+        return false
     }
 
     // MARK: - Exits
@@ -522,7 +541,9 @@ final class SelectionController: NSObject {
         // window or a text field: a deferred call would let Return commit the
         // text and then copy the screenshot in one press.
         if let monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown, handler: { [weak self] event in
-            self?.handleKeyDown(event)
+            if self?.handleKeyDown(event) == true {
+                return nil
+            }
             return event
         }) {
             longCaptureKeyMonitors.append(monitor)
@@ -545,6 +566,7 @@ final class SelectionController: NSObject {
             bar.onCopy = { [weak self] in self?.confirm() }
             bar.onPin = { [weak self] in self?.pinCurrent() }
             bar.onSave = { [weak self] in self?.saveCurrent() }
+            bar.onUndo = { [weak self] in self?.undoAnnotation() }
             bar.onCancel = { [weak self] in self?.cancel() }
             bar.onLong = { [weak self] in self?.enterLongMode() }
             bar.onAutoScroll = { [weak self] in self?.startAutoScroll() }
@@ -558,6 +580,7 @@ final class SelectionController: NSObject {
         if state != .capturingLong {
             toolbar?.showTools()
             toolbar?.setActiveTool(activeTool)
+            toolbar?.setUndoEnabled(!markHistory.isEmpty)
         }
         positionToolbar()
         positionOptions()
@@ -671,6 +694,12 @@ extension SelectionController: OverlayViewDelegate {
                 setResizeCursor(edges)
                 return
             case .move:
+                let local = viewPoint(view, globalPoint)
+                if let index = hitMark(at: local) {
+                    beginMovingMark(index, at: local)
+                    return
+                }
+                selectedMark = nil
                 if activeTool != nil, selectionCG.contains(point) {
                     beginDrawing(in: view, globalPoint: globalPoint)
                     return
@@ -688,7 +717,9 @@ extension SelectionController: OverlayViewDelegate {
         // the pixel buffer belong to the old rectangle, possibly another
         // display.
         removeTextField()
+        selectedMark = nil
         marks.removeAll()
+        clearHistory()
         draft = nil
         pixels = nil
         activeTool = nil
@@ -720,6 +751,8 @@ extension SelectionController: OverlayViewDelegate {
         case .drawing:
             updateDrawing(in: view, globalPoint: globalPoint)
             return
+        case .movingMark:
+            moveSelectedMark(in: view, globalPoint: globalPoint)
         case .creating:
             guard state == .selecting else { return }
             selectionCG = CGRect(
@@ -740,6 +773,19 @@ extension SelectionController: OverlayViewDelegate {
 
         if case .drawing = mode {
             finishDrawing()
+            return
+        }
+
+        if case .movingMark = mode {
+            if markDragMoved, let moveHistory {
+                pushHistory(moveHistory)
+            }
+            self.moveHistory = nil
+            if !markDragMoved, let index = selectedMark, marks.indices.contains(index), case .text = marks[index] {
+                beginText(at: viewPoint(view, globalPoint), in: view)
+            }
+            updateSelectionViews()
+            showToolbar()
             return
         }
 
@@ -768,7 +814,9 @@ extension SelectionController: OverlayViewDelegate {
             case .resize(let edges):
                 setResizeCursor(edges)
             case .move:
-                if activeTool != nil {
+                if hitMark(at: viewPoint(view, globalPoint)) != nil {
+                    NSCursor.openHand.set()
+                } else if activeTool != nil {
                     toolCursor().set()
                 } else {
                     NSCursor.openHand.set()
@@ -815,8 +863,11 @@ extension SelectionController: OverlayViewDelegate {
             bar.style = annotateStyle
             bar.onChange = { [weak self] in
                 self?.applyStyleToTextField()
+                self?.applyStyleToSelectedMark()
                 self?.syncMarks()
             }
+            bar.onGestureBegin = { [weak self] in self?.beginStyleGesture() }
+            bar.onGestureEnd = { [weak self] in self?.endStyleGesture() }
             bar.onAutoMosaic = { [weak self] in self?.applyAutoMosaic() }
             bar.onClearMosaic = { [weak self] in self?.clearMosaics() }
             options = bar
@@ -879,6 +930,12 @@ extension SelectionController: OverlayViewDelegate {
             entry.view.annotationMarks = active ? marks : []
             entry.view.annotationDraft = active ? draft : nil
             entry.view.annotationPixels = active ? buffer : nil
+            if active, let selectedMark, marks.indices.contains(selectedMark) {
+                entry.view.annotationSelection = marks[selectedMark].bounds.insetBy(dx: -4, dy: -4)
+                entry.view.hasAnnotationSelection = true
+            } else {
+                entry.view.hasAnnotationSelection = false
+            }
             entry.view.needsDisplay = true
         }
     }
@@ -890,6 +947,7 @@ extension SelectionController: OverlayViewDelegate {
 
     private func beginDrawing(in view: OverlayView, globalPoint: NSPoint) {
         guard let tool = activeTool else { return }
+        selectedMark = nil
         let point = viewPoint(view, globalPoint)
         drawAnchor = point
         switch tool {
@@ -954,7 +1012,9 @@ extension SelectionController: OverlayViewDelegate {
 
     private func finishDrawing() {
         if let draft, shouldCommit(draft) {
+            pushHistory(currentHistory())
             marks.append(draft)
+            selectedMark = marks.count - 1
         }
         self.draft = nil
         syncMarks()
@@ -980,6 +1040,7 @@ extension SelectionController: OverlayViewDelegate {
     private func applyAutoMosaic() {
         guard let screen = activeScreen else { return }
         let rect = Geometry.nsRectInScreen(selectionCG, screen: screen)
+        pushHistory(currentHistory())
         marks.removeAll { mark in
             if case .mosaic = mark { return true }
             return false
@@ -989,6 +1050,14 @@ extension SelectionController: OverlayViewDelegate {
     }
 
     private func clearMosaics() {
+        let hasMosaic = marks.contains { mark in
+            switch mark {
+            case .mosaic, .mosaicBrush: return true
+            default: return false
+            }
+        }
+        guard hasMosaic else { return }
+        pushHistory(currentHistory())
         marks.removeAll { mark in
             switch mark {
             case .mosaic, .mosaicBrush: return true
@@ -1000,21 +1069,148 @@ extension SelectionController: OverlayViewDelegate {
 
     private func beginText(at point: NSPoint, in view: OverlayView) {
         commitText()
+        let before = currentHistory()
+        if let existing = takeText(at: point) {
+            textHistory = before
+            openTextField(
+                in: view,
+                frame: existing.rect,
+                string: existing.string,
+                size: existing.size,
+                color: existing.color,
+                background: existing.background
+            )
+            return
+        }
         let size = annotateStyle.textSize
-        let field = NSTextField(frame: NSRect(x: point.x, y: point.y - size * 0.25, width: max(120, size * 4), height: size * 1.35))
+        let frame = NSRect(x: point.x, y: point.y - size * 0.25, width: max(120, size * 4), height: size * 1.35)
+        openTextField(
+            in: view,
+            frame: frame,
+            string: "",
+            size: size,
+            color: annotateStyle.color,
+            background: annotateStyle.textBackground
+        )
+    }
+
+    private func takeText(at point: NSPoint) -> (rect: NSRect, string: String, size: CGFloat, color: NSColor, background: NSColor?)? {
+        for index in marks.indices.reversed() {
+            guard case .text(let rect, let string, let size, let color, let background) = marks[index] else { continue }
+            guard rect.insetBy(dx: -6, dy: -4).contains(point) else { continue }
+            if selectedMark == index {
+                selectedMark = nil
+            } else if let selected = selectedMark, selected > index {
+                selectedMark = selected - 1
+            }
+            marks.remove(at: index)
+            syncMarks()
+            return (rect, string, size, color, background)
+        }
+        return nil
+    }
+
+    private func openTextField(in view: OverlayView, frame: NSRect, string: String, size: CGFloat, color: NSColor, background: NSColor?) {
+        let field = NSTextField(frame: frame)
         field.font = NSFont.systemFont(ofSize: size, weight: .medium)
-        field.textColor = annotateStyle.color
-        field.backgroundColor = annotateStyle.textBackground ?? .clear
-        field.drawsBackground = annotateStyle.textBackground != nil
+        field.textColor = color
+        field.stringValue = string
+        field.backgroundColor = background ?? .clear
+        field.drawsBackground = background != nil
         field.isBordered = false
         field.isBezeled = false
         field.focusRingType = .none
         field.delegate = self
-        field.placeholderString = "输入文字"
+        if string.isEmpty {
+            field.placeholderString = "输入文字"
+        }
         view.addSubview(field)
         view.window?.makeFirstResponder(field)
+        field.currentEditor()?.selectedRange = NSRange(location: (string as NSString).length, length: 0)
         textField = field
         textHost = view
+    }
+
+    private func hitMark(at point: NSPoint) -> Int? {
+        for index in marks.indices.reversed() where marks[index].hit(point) {
+            return index
+        }
+        return nil
+    }
+
+    private func beginMovingMark(_ index: Int, at point: NSPoint) {
+        selectedMark = index
+        moveHistory = currentHistory()
+        markDragOrigin = marks[index]
+        markDragAnchor = point
+        markDragMoved = false
+        dragMode = .movingMark
+        adoptStyle(from: marks[index])
+        syncMarks()
+    }
+
+    private func moveSelectedMark(in view: OverlayView, globalPoint: NSPoint) {
+        guard let index = selectedMark, let origin = markDragOrigin, marks.indices.contains(index) else { return }
+        let point = viewPoint(view, globalPoint)
+        let dx = point.x - markDragAnchor.x
+        let dy = point.y - markDragAnchor.y
+        if hypot(dx, dy) > 2 { markDragMoved = true }
+        marks[index] = origin.translated(dx: dx, dy: dy)
+        syncMarks()
+    }
+
+    private func adoptStyle(from mark: AnnotationMark) {
+        switch mark {
+        case .shape(_, _, let style), .line(_, _, let style), .arrow(_, _, let style), .pen(_, let style):
+            annotateStyle.color = style.color
+            annotateStyle.lineWidth = style.width
+            annotateStyle.filled = style.filled
+        case .text(_, _, let size, let color, let background):
+            annotateStyle.color = color
+            annotateStyle.textSize = size
+            annotateStyle.textBackground = background
+        default:
+            return
+        }
+        guard let tool = tool(matching: mark) else { return }
+        activeTool = tool
+        toolbar?.setActiveTool(tool)
+        showOptions(for: tool)
+    }
+
+    private func applyStyleToSelectedMark() {
+        guard let index = selectedMark, marks.indices.contains(index) else { return }
+        guard tool(matching: marks[index]) == activeTool else { return }
+        if styleHistory == nil {
+            styleHistory = currentHistory()
+        }
+        marks[index] = marks[index].applying(annotateStyle)
+        if !styleGesture {
+            sealStyleHistory()
+        }
+    }
+
+    private func beginStyleGesture() {
+        styleGesture = true
+        guard styleHistory == nil else { return }
+        guard let index = selectedMark, marks.indices.contains(index),
+              tool(matching: marks[index]) == activeTool else { return }
+        styleHistory = currentHistory()
+    }
+
+    private func endStyleGesture() {
+        styleGesture = false
+        sealStyleHistory()
+    }
+
+    private func tool(matching mark: AnnotationMark) -> AnnotateTool? {
+        switch mark {
+        case .shape, .line: return .shape
+        case .arrow: return .arrow
+        case .pen: return .pen
+        case .text: return .text
+        default: return nil
+        }
     }
 
     private func applyStyleToTextField() {
@@ -1031,11 +1227,75 @@ extension SelectionController: OverlayViewDelegate {
     private func commitText() {
         guard let field = textField else { return }
         let string = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let beforeEdit = textHistory
+        textHistory = nil
         if !string.isEmpty {
-            marks.append(.text(field.frame, string, annotateStyle.textSize, annotateStyle.color, annotateStyle.textBackground))
+            if let beforeEdit {
+                pushHistory(beforeEdit)
+            } else {
+                pushHistory(currentHistory())
+            }
+            let size = field.font?.pointSize ?? annotateStyle.textSize
+            let color = field.textColor ?? annotateStyle.color
+            let background = field.drawsBackground ? field.backgroundColor : nil
+            marks.append(.text(field.frame, string, size, color, background))
+            selectedMark = marks.count - 1
+        } else if let beforeEdit {
+            pushHistory(beforeEdit)
         }
         removeTextField()
         syncMarks()
+    }
+
+    private struct MarkHistory {
+        var marks: [AnnotationMark]
+        var selected: Int?
+    }
+
+    private func currentHistory() -> MarkHistory {
+        MarkHistory(marks: marks, selected: selectedMark)
+    }
+
+    private func pushHistory(_ entry: MarkHistory) {
+        markHistory.append(entry)
+        if markHistory.count > 40 {
+            markHistory.removeFirst()
+        }
+        toolbar?.setUndoEnabled(true)
+    }
+
+    private func clearHistory() {
+        markHistory.removeAll()
+        moveHistory = nil
+        textHistory = nil
+        styleHistory = nil
+        styleGesture = false
+        toolbar?.setUndoEnabled(false)
+    }
+
+    private func sealStyleHistory() {
+        guard let saved = styleHistory else { return }
+        styleHistory = nil
+        pushHistory(saved)
+    }
+
+    /// Puts the annotations back to where they were before the last completed
+    /// stroke, move, restyle, mosaic or text edit. An open text field is
+    /// committed first, so one undo drops that edit.
+    private func undoAnnotation() {
+        endStyleGesture()
+        commitText()
+        guard state == .selected, let entry = markHistory.popLast() else {
+            toolbar?.setUndoEnabled(!markHistory.isEmpty)
+            return
+        }
+        marks = entry.marks
+        selectedMark = entry.selected
+        draft = nil
+        moveHistory = nil
+        textHistory = nil
+        syncMarks()
+        toolbar?.setUndoEnabled(!markHistory.isEmpty)
     }
 
     private func removeTextField() {

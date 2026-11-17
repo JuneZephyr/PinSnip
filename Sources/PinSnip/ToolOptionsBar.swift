@@ -5,6 +5,8 @@ final class ToolOptionsBar: NSPanel {
 
     var style = AnnotateStyle()
     var onChange: (() -> Void)?
+    var onGestureBegin: (() -> Void)?
+    var onGestureEnd: (() -> Void)?
     var onAutoMosaic: (() -> Void)?
     var onClearMosaic: (() -> Void)?
 
@@ -99,6 +101,7 @@ final class ToolOptionsBar: NSPanel {
         stroke.onClick = { [weak self] in
             self?.style.filled = false
             self?.reload(tool: .shape)
+            self?.onChange?()
         }
         place(stroke, x: x, height: height, width: 32)
         x += 32
@@ -106,6 +109,7 @@ final class ToolOptionsBar: NSPanel {
         fill.onClick = { [weak self] in
             self?.style.filled = true
             self?.reload(tool: .shape)
+            self?.onChange?()
         }
         place(fill, x: x, height: height, width: 32)
         x += 32
@@ -242,6 +246,8 @@ final class ToolOptionsBar: NSPanel {
         number.textColor = Palette.secondary
         number.alignment = .left
         let box = SliderBox(valueLabel: number, changed: changed)
+        box.onBegin = { [weak self] in self?.onGestureBegin?() }
+        box.onEnd = { [weak self] in self?.onGestureEnd?() }
         sliderBoxes.append(box)
         slider.target = box
         slider.action = #selector(SliderBox.moved(_:))
@@ -314,16 +320,29 @@ final class ToolOptionsBar: NSPanel {
 private final class SliderBox: NSObject {
     let valueLabel: NSTextField
     let changed: (CGFloat) -> Void
+    var onBegin: (() -> Void)?
+    var onEnd: (() -> Void)?
+    private var open = false
 
     init(valueLabel: NSTextField, changed: @escaping (CGFloat) -> Void) {
         self.valueLabel = valueLabel
         self.changed = changed
     }
 
+    /// A drag is one undo step. Mouse-down records the mark, mouse-up closes it.
     @objc func moved(_ sender: NSSlider) {
+        let type = NSApp.currentEvent?.type
+        if !open, type != .leftMouseUp {
+            open = true
+            onBegin?()
+        }
         let value = CGFloat(sender.doubleValue)
         valueLabel.stringValue = "\(Int(value.rounded()))"
         changed(value)
+        if type == .leftMouseUp {
+            open = false
+            onEnd?()
+        }
     }
 }
 
