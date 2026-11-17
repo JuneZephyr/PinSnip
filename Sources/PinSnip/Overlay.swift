@@ -105,10 +105,18 @@ final class OverlayView: NSView {
             return
         }
 
-        let border = NSBezierPath(rect: selection.insetBy(dx: -0.5, dy: -0.5))
+        // Stroke only outside the selection. A line drawn on the inside edge is
+        // captured with every frame and shows up as a blue stripe at each join.
+        NSGraphicsContext.current?.saveGraphicsState()
+        let outside = NSBezierPath(rect: bounds)
+        outside.append(NSBezierPath(rect: selection))
+        outside.windingRule = .evenOdd
+        outside.addClip()
+        let border = NSBezierPath(rect: selection.insetBy(dx: -1, dy: -1))
         NSColor.systemBlue.setStroke()
         border.lineWidth = 2
         border.stroke()
+        NSGraphicsContext.current?.restoreGraphicsState()
 
         if !live {
             drawHandles()

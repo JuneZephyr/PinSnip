@@ -344,12 +344,21 @@ final class SelectionController: NSObject {
 
         let displayPixelHeight = snap.image.height
         let maxHeight = min(30000, max(1, 20 * displayPixelHeight))
+        // Manual mode does not stop on a still page or a bad match, so a
+        // misaligned page would otherwise grow until maxHeight. Twenty copies
+        // of the selection the user actually captured is the lower ceiling.
+        let progressLimit = min(maxHeight, max(seed.height, 20 * seed.height))
 
-        let capture = LongCapture(region: selectionCG, displayID: displayID, maxHeight: maxHeight, seed: seed)
+        let capture = LongCapture(region: selectionCG, displayID: displayID,
+                                  maxHeight: maxHeight, progressLimit: progressLimit, seed: seed)
         capture.setStitchingEnabled(toolbar?.direction != .horizontal)
         capture.onPreview = { [weak self] image, height in
             self?.growingImage = image
             self?.updatePreview(image: image, pixelHeight: height)
+        }
+        capture.onNotice = { [weak self] text in
+            guard let self, let image = self.growingImage else { return }
+            self.updatePreview(image: image, pixelHeight: image.height, caption: text)
         }
         capture.onFinish = { [weak self] image, reason in
             self?.longCaptureDidFinish(image, reason: reason)
@@ -388,6 +397,17 @@ final class SelectionController: NSObject {
         }
         guard state == .selected || state == .result else { return }
         finishSave()
+    }
+
+    /// Manual mode: the page stays still until the user drags or scrolls it.
+    private func useManualScroll() {
+        guard state == .capturingLong, autoScrollActive else { return }
+        autoScrollActive = false
+        toolbar?.setAutoScrollActive(false)
+        longCapture?.endAutoScroll()
+        if let image = growingImage {
+            updatePreview(image: image, pixelHeight: image.height)
+        }
     }
 
     private func startAutoScroll() {
@@ -452,6 +472,7 @@ final class SelectionController: NSObject {
         case .userDone: note = "已完成"
         case .misaligned: note = "这一帧对不齐，已在此停下"
         case .limitReached: note = "已达高度上限，已停止"
+        case .manualLimit: note = "已达手动高度上限，已停止"
         }
 
         for entry in entries {
@@ -527,6 +548,7 @@ final class SelectionController: NSObject {
             bar.onCancel = { [weak self] in self?.cancel() }
             bar.onLong = { [weak self] in self?.enterLongMode() }
             bar.onAutoScroll = { [weak self] in self?.startAutoScroll() }
+            bar.onManual = { [weak self] in self?.useManualScroll() }
             bar.onDirection = { [weak self] direction in
                 self?.longCapture?.setStitchingEnabled(direction == .vertical)
             }
@@ -579,7 +601,7 @@ final class SelectionController: NSObject {
             maxScreenHeight: screen.frame.height * 0.7,
             caption: caption ?? (autoScrollActive
                 ? "已拼接 \(pixelHeight) px · 再点一次停止"
-                : "滚动页面延长，或点自动滚动")
+                : "手动：拖动或滚动页面即可延长")
         )
         positionPreview()
         preview?.orderFrontRegardless()

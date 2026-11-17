@@ -139,9 +139,20 @@ final class CaptureEngine {
             throw CaptureError.noContent
         }
 
-        let excluded = exclusionSet()
-        let excludedWindows = content.windows.filter { excluded.contains($0.windowID) }
-        let filter = SCContentFilter(display: display, excludingWindows: excludedWindows)
+        // The shareable-content list is taken once, before the overlay exists.
+        // Excluding our own application drops the selection border, the toolbar
+        // and the preview even when those windows were created afterwards.
+        // A border left inside the crop becomes a blue line at every join.
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        let ownApps = content.applications.filter { $0.processID == ownPID }
+        let filter: SCContentFilter
+        if ownApps.isEmpty {
+            let excluded = exclusionSet()
+            let excludedWindows = content.windows.filter { excluded.contains($0.windowID) }
+            filter = SCContentFilter(display: display, excludingWindows: excludedWindows)
+        } else {
+            filter = SCContentFilter(display: display, excludingApplications: ownApps, exceptingWindows: [])
+        }
 
         let image = try await captureImage(contentFilter: filter, configuration: config)
         let scale = config.width > 0 ? CGFloat(config.width) / CGFloat(display.width) : 1

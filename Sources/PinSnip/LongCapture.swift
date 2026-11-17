@@ -5,6 +5,10 @@ import Foundation
 /// Stitches a vertical long screenshot. The first frame is the selection the
 /// user already made. Nothing scrolls until `beginAutoScroll()`; until then the
 /// loop only extends the image when the page itself moves.
+///
+/// `progressLimit` bounds a manual scroll whose page keeps changing but never
+/// lines up with what is already stitched (a video, a carousel, a blinking
+/// caret). Automatic scrolling is capped by `maxHeight` only.
 final class LongCapture {
 
     enum EndReason {
@@ -13,14 +17,17 @@ final class LongCapture {
         case userDone
         case misaligned
         case limitReached
+        case manualLimit
     }
 
     var onPreview: ((CGImage, Int) -> Void)?
     var onFinish: ((CGImage?, EndReason) -> Void)?
+    var onNotice: ((String) -> Void)?
 
     private let region: CGRect
     private let displayID: CGDirectDisplayID
     private let maxHeight: Int
+    private let progressLimit: Int
     private let seed: CGImage
     private let queue = DispatchQueue(label: "com.personal.pinsnip.longcapture", qos: .userInitiated)
 
@@ -33,10 +40,13 @@ final class LongCapture {
     private var stitchingEnabled = true
     private var finished = false
 
-    init(region: CGRect, displayID: CGDirectDisplayID, maxHeight: Int, seed: CGImage) {
+    init(region: CGRect, displayID: CGDirectDisplayID, maxHeight: Int, progressLimit: Int = 0, seed: CGImage) {
         self.region = region
         self.displayID = displayID
         self.maxHeight = max(1, maxHeight)
+        // 0 means "no separate limit": the manual scroll is then capped by
+        // maxHeight like any other mode.
+        self.progressLimit = max(0, progressLimit)
         self.seed = seed
     }
 
@@ -88,8 +98,17 @@ final class LongCapture {
         while !stopRequested && !finishRequested {
             guard let buffer = self.buffer else { break }
 
-            if buffer.height >= maxHeight {
-                complete(buffer.makeImage(), .limitReached)
+            // Manual mode never decides the page has reached the bottom, and a
+            // frame that does not line up is skipped rather than ending the
+            // session. A video or blinking caret can therefore look like new
+            // content on every sample. Cap that path at progressLimit, which is
+            // about twenty selection heights, and keep the taller maxHeight for
+            // automatic scrolling only.
+            let manualCap = !autoScroll && progressLimit > 0
+            let ceiling = manualCap ? min(maxHeight, progressLimit) : maxHeight
+            buffer.maxHeight = ceiling
+            if buffer.height >= ceiling {
+                complete(buffer.makeImage(), manualCap && ceiling < maxHeight ? .manualLimit : .limitReached)
                 return
             }
 
@@ -114,13 +133,19 @@ final class LongCapture {
     }
 
     /// Adds the newly revealed rows. Returns false when the session has ended.
+    ///
+    /// A row is appended only when the bottom of the previous frame is still
+    /// inside the new one. That is what keeps the long image continuous: the
+    /// strip glued on is exactly the part that just scrolled into view.
     private func append(_ frame: CGImage, endWhenStill: Bool) -> Bool {
         guard let previous = lastFrame, let buffer else { return false }
-        guard let shift = Stitcher.shift(previous: previous, new: frame), shift.quality <= 18 else {
+        guard let shift = Stitcher.shift(previous: previous, new: frame),
+              Self.continuous(shift, height: previous.height) else {
             if endWhenStill {
                 complete(buffer.makeImage(), .misaligned)
                 return false
             }
+            reportNotice("滚得太快，这一段没接上。慢一点滚，让上一屏还留在选区里")
             return true
         }
 
@@ -148,6 +173,29 @@ final class LongCapture {
         lastFrame = frame
         publishPreview()
         return true
+    }
+
+    /// True when the join cannot skip or repeat a stretch of the page.
+    /// Small moves may be a little fuzzy. A move past about half the selection
+    /// has to match closely, and a move that leaves almost no overlap is refused.
+    private static func continuous(_ shift: Stitcher.Shift, height: Int) -> Bool {
+        if shift.quality > 18 { return false }
+        let ratio = Double(shift.pixels) / Double(max(height, 1))
+        if ratio > 0.85 { return false }
+        if ratio > 0.55 && shift.quality > 6 { return false }
+        return true
+    }
+
+    private var lastNoticeAt = Date.distantPast
+
+    private func reportNotice(_ text: String) {
+        let now = Date()
+        guard now.timeIntervalSince(lastNoticeAt) >= 1.2 else { return }
+        lastNoticeAt = now
+        DispatchQueue.main.async { [weak self] in
+            guard let self, !self.finished else { return }
+            self.onNotice?(text)
+        }
     }
 
     /// Blocks until the page under the selection actually changes.

@@ -1,8 +1,9 @@
 import CoreGraphics
 import Foundation
 
-/// A growable RGBA canvas that rows can be appended to. The logical row 0 is
-/// the top of the image, so the drawing context is flipped.
+/// A growable RGBA canvas. Row 0 of the finished image is the top of the page.
+/// The context keeps Quartz's bottom-left origin and draws each capture upright;
+/// a y-flip here turns the whole long screenshot upside down.
 final class StitchBuffer {
 
     private(set) var width: Int
@@ -44,24 +45,26 @@ final class StitchBuffer {
         }
         guard height + allowed <= capacity, let context else { return }
 
-        context.saveGState()
-        context.translateBy(x: 0, y: CGFloat(capacity))
-        context.scaleBy(x: 1, y: -1)
-        context.draw(strip, in: CGRect(x: 0, y: height, width: width, height: allowed))
-        context.restoreGState()
+        // Content stays packed against the top. Quartz y grows upward, so the
+        // next strip is drawn just below what is already there.
+        let quartzY = CGFloat(capacity - height - allowed)
+        context.draw(
+            strip,
+            in: CGRect(x: 0, y: quartzY, width: CGFloat(width), height: CGFloat(allowed))
+        )
         height += allowed
     }
 
     private func grow(to newCapacity: Int) {
         guard newCapacity > capacity,
               let newContext = StitchBuffer.makeContext(width: width, height: newCapacity) else { return }
-        newContext.saveGState()
-        newContext.translateBy(x: 0, y: CGFloat(newCapacity))
-        newContext.scaleBy(x: 1, y: -1)
         if let previous = context?.makeImage() {
-            newContext.draw(previous, in: CGRect(x: 0, y: 0, width: width, height: capacity))
+            let shift = CGFloat(newCapacity - capacity)
+            newContext.draw(
+                previous,
+                in: CGRect(x: 0, y: shift, width: CGFloat(width), height: CGFloat(capacity))
+            )
         }
-        newContext.restoreGState()
         context = newContext
         capacity = newCapacity
     }
@@ -101,7 +104,9 @@ enum Stitcher {
 
         let strip = max(3, smallHeight / 8)
         let limit = smallHeight - strip
-        var bestY = 0
+        // Start at "no movement". A blank or repeating region matches many
+        // places equally; keeping the smallest move avoids inventing a gap.
+        var bestY = limit
         var bestScore = Double.greatestFiniteMagnitude
 
         for candidate in 0...limit {
@@ -117,8 +122,11 @@ enum Stitcher {
                     score += Double(abs(Int(a[aIndex + 2]) - Int(b[bIndex + 2])))
                 }
             }
-            if score < bestScore {
+            let slack = max(1.5, bestScore * 0.08)
+            if score + 0.01 < bestScore {
                 bestScore = score
+                bestY = candidate
+            } else if candidate > bestY, score <= bestScore + slack {
                 bestY = candidate
             }
         }
@@ -133,7 +141,10 @@ enum Stitcher {
 /// Small pixel helpers shared by the stitcher and the stability detector.
 enum ImageMath {
 
-    /// Downsamples an image into a top-down RGBA buffer.
+    /// Downsamples an image into a top-down RGBA buffer. The first byte is the
+    /// top-left pixel, which is also where `CGImage` stores its first row.
+    /// Flipping the context here reverses that and makes the stitcher treat a
+    /// downward scroll as upward.
     static func rgba(_ image: CGImage, width: Int, height: Int) -> [UInt8]? {
         guard width > 0, height > 0 else { return nil }
         var buffer = [UInt8](repeating: 0, count: width * height * 4)
@@ -148,11 +159,7 @@ enum ImageMath {
         ) else { return nil }
 
         context.interpolationQuality = .low
-        context.saveGState()
-        context.translateBy(x: 0, y: CGFloat(height))
-        context.scaleBy(x: 1, y: -1)
-        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
-        context.restoreGState()
+        context.draw(image, in: CGRect(x: 0, y: 0, width: CGFloat(width), height: CGFloat(height)))
         return buffer
     }
 

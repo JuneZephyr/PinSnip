@@ -19,6 +19,7 @@ final class SelectionToolbar: NSPanel {
     var onLong: (() -> Void)?
     var onTool: ((AnnotateTool) -> Void)?
     var onAutoScroll: (() -> Void)?
+    var onManual: (() -> Void)?
     var onDirection: ((Direction) -> Void)?
 
     private(set) var direction: Direction = .vertical
@@ -27,6 +28,7 @@ final class SelectionToolbar: NSPanel {
     private let chrome = CapsuleChrome()
     private var verticalRadio: RadioControl?
     private var horizontalRadio: RadioControl?
+    private var manualRadio: RadioControl?
     private var autoButton: PillButton?
     private var toolButtons: [AnnotateTool: IconButton] = [:]
 
@@ -57,6 +59,7 @@ final class SelectionToolbar: NSPanel {
         chrome.subviews.forEach { $0.removeFromSuperview() }
         verticalRadio = nil
         horizontalRadio = nil
+        manualRadio = nil
         autoButton = nil
         toolButtons = [:]
 
@@ -133,6 +136,14 @@ final class SelectionToolbar: NSPanel {
         horizontalRadio = horizontal
         x += horizontalWidth + 16
 
+        let manual = RadioControl(title: "手动", on: !autoScrollActive)
+        manual.onClick = { [weak self] in self?.onManual?() }
+        let manualWidth = manual.fittingWidth
+        manual.frame = NSRect(x: x, y: (height - 24) / 2, width: manualWidth, height: 24)
+        chrome.addSubview(manual)
+        manualRadio = manual
+        x += manualWidth + 14
+
         let pillFont = NSFont.systemFont(ofSize: 14, weight: .medium)
         let pillWidth = max(
             SelectionToolbar.measured("自动滚动", font: pillFont),
@@ -193,6 +204,10 @@ final class SelectionToolbar: NSPanel {
         autoButton?.title = active ? "滚动中" : "自动滚动"
         autoButton?.isRunning = active
         autoButton?.needsDisplay = true
+        // The manual/auto switch is only meaningful while the direction is
+        // vertical: horizontal long captures are watch-only, so the auto pill
+        // never runs and claiming "手动" would be misleading.
+        manualRadio?.isOn = !active && direction == .vertical
     }
 
     private func choose(_ direction: Direction) {
@@ -200,6 +215,7 @@ final class SelectionToolbar: NSPanel {
         self.direction = direction
         verticalRadio?.isOn = direction == .vertical
         horizontalRadio?.isOn = direction == .horizontal
+        manualRadio?.isOn = direction == .vertical
         onDirection?(direction)
     }
 
